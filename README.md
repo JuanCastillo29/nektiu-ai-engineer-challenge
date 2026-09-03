@@ -1,6 +1,6 @@
 # Nektiu — AI Engineer Challenge
 
-Bienvenido/a al reto técnico de **Nektiu** para el puesto de **AI Engineer / Data Junior**.
+Bienvenido/a al reto técnico de **Nektiu** para el puesto de **AI Engineer / Data**.
 
 No buscamos que resuelvas un examen teórico: queremos verte **construir algo que funcione de punta a punta** y, sobre todo, que **entiendas y sepas defender** lo que has hecho. Puedes (y te animamos a) usar herramientas de desarrollo asistido por IA como Cursor, Copilot o similares — forman parte de nuestro día a día.
 
