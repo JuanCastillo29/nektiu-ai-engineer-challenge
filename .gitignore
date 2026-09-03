@@ -1,0 +1,21 @@
+# Entornos y secretos
+.env
+.env.local
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Node / frontend
+node_modules/
+.next/
+dist/
+build/
+
+# Vercel
+.vercel
+
+# SO / editor
+.DS_Store
+.idea/
+.vscode/
