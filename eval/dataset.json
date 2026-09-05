@@ -1,7 +1,7 @@
 {
   "name": "nektibot_eval",
   "document": "data/sample.md",
-  "description": "50 preguntas sobre el manual de NektiBot, escritas como las haría un usuario real. De momento evalúan el retrieval: qué sección debe recuperarse, o si el documento no cubre la pregunta. La evaluación de la respuesta generada se añadirá más adelante.",
+  "description": "50 preguntas sobre el manual de NektiBot, escritas como las haría un usuario real. `expected_source` es la verdad de referencia del retrieval; la respuesta generada la juzga `eval/run.py` contra el documento entero, no contra este campo.",
   "how_to_read": {
     "expected_source": "Sección de la que debe salir la respuesta. null = el documento no lo cubre y el sistema debe abstenerse.",
     "probes": "Qué capacidad pone a prueba el caso. Los que llevan 'probes' son los candidatos a punto de quiebre: de ahí salen las siguientes mejoras del sistema, no de subir el porcentaje global.",
