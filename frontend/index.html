@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>NektiBot — asistente del manual</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📘</text></svg>">
 <style>
   :root {
     --fondo: #f4f5f7;
@@ -179,6 +180,8 @@
   const entrada = document.getElementById("pregunta");
   const boton = formulario.querySelector("button");
 
+  const TIMEOUT_MS = 100000;
+
   for (const texto of EJEMPLOS) {
     const chip = document.createElement("button");
     chip.textContent = texto;
@@ -234,6 +237,7 @@
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ question: pregunta }),
+        signal: AbortSignal.timeout(TIMEOUT_MS),
       });
       const datos = await respuesta.json().catch(() => ({}));
 
@@ -242,7 +246,10 @@
       }
       añadir("asistente", datos.answer, datos.sources || []);
     } catch (error) {
-      añadir("error", `No se pudo responder: ${error.message}`);
+      const motivo = error.name === "TimeoutError"
+        ? "el servidor ha tardado demasiado en responder."
+        : error.message;
+      añadir("error", `No se pudo responder: ${motivo}`);
     } finally {
       cargando.remove();
       entrada.disabled = boton.disabled = false;
