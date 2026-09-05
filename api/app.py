@@ -143,7 +143,7 @@ def generate(question: str, results: list[rag.ScoredChunk]) -> ChatResponse:
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "model": MODEL}
 
 
 @app.post("/api/chat", response_model=ChatResponse)

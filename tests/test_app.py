@@ -167,7 +167,7 @@ class TestHealth(unittest.TestCase):
     def test_health_ok(self):
         response = TestClient(app.app).get("/api/health")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"status": "ok"})
+        self.assertEqual(response.json(), {"status": "ok", "model": app.MODEL})
 
 
 class TestChat(unittest.TestCase):
