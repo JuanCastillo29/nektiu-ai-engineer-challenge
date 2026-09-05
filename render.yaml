@@ -1,0 +1,15 @@
+# Blueprint de Render: un único servicio web que sirve la API y el frontend.
+services:
+  - type: web
+    name: nektibot
+    runtime: python
+    plan: free
+    region: frankfurt
+    buildCommand: pip install -r api/requirements.txt
+    # `app.py` importa `rag` como módulo suelto, así que uvicorn arranca desde api/.
+    startCommand: cd api && uvicorn app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    envVars:
+      # Sin valor en el blueprint: se rellena a mano en el dashboard.
+      - key: OPENAI_API_KEY
+        sync: false
