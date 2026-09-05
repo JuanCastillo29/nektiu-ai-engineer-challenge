@@ -1,4 +1,4 @@
-"""Tests unitarios del retrieval BM25 (`python -m unittest discover tests`)."""
+"""Tests unitarios del retrieval híbrido (`python -m unittest discover tests`)."""
 
 from __future__ import annotations
 
@@ -10,6 +10,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "api"))
 
 import rag
+
+rag.INDEX = rag.HybridIndex(rag.CHUNKS)  # sin embedder: los tests no tocan la red
 
 
 class TestTokenize(unittest.TestCase):
@@ -118,6 +120,106 @@ class TestBM25Formula(unittest.TestCase):
         self.assertTrue(self.index.search("perro").grounded)
 
 
+class FakeEmbedder:
+    """Embeddings de mentira: cada texto lleva su vector escrito en el propio test."""
+
+    def __init__(self, vectors: dict[str, list[float]]):
+        self.vectors = vectors
+        self.calls = 0
+
+    def __call__(self, texts: list[str]) -> list[list[float]]:
+        self.calls += 1
+        return [self.vectors[t] for t in texts]
+
+
+def boom(texts):
+    raise RuntimeError("502")
+
+
+PLANES = rag.Chunk("Planes", "El plan Business cuesta 149 euros al mes.")
+SOPORTE = rag.Chunk("Soporte", "Atendemos de 9:00 a 18:00, de lunes a viernes.")
+
+# Ejes ortogonales: "precio" y "horario". La pregunta por el horario no comparte ni un
+# término con el documento —ese es justo el fallo del léxico— pero apunta al mismo eje.
+VECTORS = {
+    PLANES.indexable: [1.0, 0.0, 0.0],
+    SOPORTE.indexable: [0.0, 1.0, 0.0],
+    "¿En qué horario atienden?": [0.0, 1.0, 0.0],
+    "¿Cuánto cuesta el plan Business?": [1.0, 0.0, 0.0],
+    "¿Cómo se cocina una paella?": [0.6, 0.6, 0.0],
+    "tibia": [0.28, 0.28, 0.92],  # coseno 0.28 con ambos: por debajo de MIN_COSINE
+}
+
+
+def hybrid(embed=None) -> rag.HybridIndex:
+    return rag.HybridIndex([PLANES, SOPORTE], embed=embed or FakeEmbedder(VECTORS))
+
+
+class TestEmbeddingIndex(unittest.TestCase):
+    def test_normaliza_los_vectores(self):
+        index = rag.EmbeddingIndex([PLANES], embed=lambda texts: [[3.0, 4.0]])
+        self.assertEqual(index.vectors().tolist(), [[0.6, 0.8]])
+
+    def test_los_vectores_de_los_chunks_se_calculan_una_sola_vez(self):
+        embedder = FakeEmbedder(VECTORS)
+        index = rag.EmbeddingIndex([PLANES, SOPORTE], embed=embedder)
+        index.similarities("¿Cuánto cuesta el plan Business?")
+        index.similarities("¿Cuánto cuesta el plan Business?")
+        self.assertEqual(embedder.calls, 3)  # 1 de los chunks + 1 por pregunta
+
+    def test_coseno_entre_pregunta_y_chunks(self):
+        sims = rag.EmbeddingIndex([PLANES, SOPORTE], embed=FakeEmbedder(VECTORS)).similarities(
+            "¿En qué horario atienden?"
+        )
+        self.assertAlmostEqual(sims[0], 0.0)
+        self.assertAlmostEqual(sims[1], 1.0)
+
+    def test_un_fallo_del_proveedor_apaga_el_denso_sin_propagarse(self):
+        index = rag.EmbeddingIndex([PLANES], embed=boom)
+        self.assertIsNone(index.similarities("lo que sea"))
+        self.assertFalse(index.available)
+
+
+class TestHybridIndex(unittest.TestCase):
+    def test_recupera_sin_vocabulario_comun(self):
+        """El fallo que arregla el denso: "horario" no aparece en el documento."""
+        titles = [s.chunk.title for s in hybrid().search("¿En qué horario atienden?").results]
+        self.assertEqual(titles[0], "Soporte")
+
+    def test_el_lexico_sigue_contando(self):
+        results = hybrid().search("¿Cuánto cuesta el plan Business?").results
+        self.assertEqual(results[0].chunk.title, "Planes")
+        self.assertGreater(results[0].lexical, 0)
+
+    def test_score_rrf_golden(self):
+        # "Planes" es 1º por las dos vías: 1/(60+1) + 1/(60+1).
+        results = hybrid().search("¿Cuánto cuesta el plan Business?").results
+        self.assertEqual(len(results), 1)
+        self.assertAlmostEqual(results[0].score, 2 / 61)
+
+    def test_un_candidato_de_una_sola_via_puntua_una_vez(self):
+        # Nada de "horario" ni "atienden" está en el documento: solo entra por el denso.
+        results = hybrid().search("¿En qué horario atienden?").results
+        self.assertAlmostEqual(results[0].score, 1 / 61)
+        self.assertEqual(results[0].lexical, 0.0)
+
+    def test_el_suelo_de_coseno_descarta_al_candidato_tibio(self):
+        retrieval = hybrid().search("tibia")
+        self.assertEqual(retrieval.results, [])
+        self.assertFalse(retrieval.grounded)
+
+    def test_sin_denso_es_bm25(self):
+        index = rag.HybridIndex([PLANES, SOPORTE])
+        self.assertFalse(index.hybrid)
+        results = index.search("¿Cómo se cocina una paella?").results
+        self.assertEqual(results, [])
+
+    def test_si_el_denso_se_cae_la_busqueda_sigue(self):
+        index = hybrid(embed=boom)
+        self.assertEqual(index.search("¿En qué horario atienden?").results, [])  # solo BM25
+        self.assertGreater(len(index.search("plan Business").results), 0)
+
+
 class TestRetrieval(unittest.TestCase):
     def test_sources_sin_duplicados_y_en_orden(self):
         a, b = rag.Chunk("A", "x"), rag.Chunk("B", "y")
@@ -140,6 +242,11 @@ class TestRetrieveIntegracion(unittest.TestCase):
     def test_precio_cita_la_seccion_de_planes(self):
         sources = rag.retrieve("¿Cuánto cuesta el plan Business?").sources
         self.assertIn("Planes y precios", [c.title for c in sources])
+
+    def test_el_indice_por_defecto_es_lexico_sin_api_key(self):
+        # INDEX se reconstruye sin embedder arriba: ni red ni key en los tests.
+        self.assertFalse(rag.INDEX.hybrid)
+        self.assertEqual(rag.retriever_name(), "léxico (BM25)")
 
     def test_k_por_defecto(self):
         self.assertEqual(rag.DEFAULT_K, 2)

@@ -17,6 +17,8 @@ from openai import OpenAIError
 import app
 import rag
 
+rag.INDEX = rag.HybridIndex(rag.CHUNKS)  # sin embedder: los tests no tocan la red
+
 
 def completion(content):
     """Réplica mínima de lo que devuelve `chat.completions.create`."""
@@ -167,7 +169,15 @@ class TestHealth(unittest.TestCase):
     def test_health_ok(self):
         response = TestClient(app.app).get("/api/health")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"status": "ok", "model": app.MODEL})
+        self.assertEqual(
+            response.json(),
+            {
+                "status": "ok",
+                "model": app.MODEL,
+                "hybrid_retrieval": False,
+                "embedding_model": "text-embedding-3-small",
+            },
+        )
 
 
 class TestChat(unittest.TestCase):

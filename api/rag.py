@@ -1,17 +1,26 @@
 """
 Retrieval del asistente: trocea el documento y busca los fragmentos relevantes.
 
-Etapa actual: BM25 léxico (monolingüe español) sobre chunks definidos por los encabezados `##`.
+Híbrido: BM25 léxico + embeddings densos, fusionados por RRF. El léxico acierta el
+término exacto; el denso cubre la pregunta que no comparte vocabulario con el documento.
+Sin API key el denso se apaga y queda solo BM25.
 """
 
 from __future__ import annotations
 
 import math
+import os
 import re
+import threading
 import unicodedata
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
+
+import numpy as np
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).parent / ".env")  # la key decide si hay retrieval denso
 
 DATA_PATH = Path(__file__).parent.parent / "data" / "sample.md"
 
@@ -19,6 +28,11 @@ K1 = 1.5
 B = 0.75
 
 DEFAULT_K = 2
+
+EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+
+MIN_COSINE = 0.30
+RRF_K = 60
 
 _ES_PLURAL_ENDINGS = "lnrdzjsxy"
 
@@ -74,6 +88,8 @@ class Chunk:
 class ScoredChunk:
     chunk: Chunk
     score: float
+    lexical: float = 0.0
+    dense: float | None = None
 
 
 @dataclass(frozen=True)
@@ -134,32 +150,134 @@ class BM25Index:
             total += self.idf[term] * (tf * (K1 + 1)) / (tf + K1 * length_norm)
         return total
 
-    def search(self, question: str, k: int = DEFAULT_K) -> Retrieval:
-        """Los k mejores. Score 0 significa no compartir ningún término con la pregunta."""
+    def scores(self, question: str) -> list[float]:
         query_tokens = tokenize(question)
         if not query_tokens:
-            return Retrieval([])
+            return [0.0] * len(self.chunks)
+        return [self.score(query_tokens, i) for i in range(len(self.chunks))]
 
+    def search(self, question: str, k: int = DEFAULT_K) -> Retrieval:
         scored = [
-            ScoredChunk(chunk, score)
-            for i, chunk in enumerate(self.chunks)
-            if (score := self.score(query_tokens, i)) > 0
+            ScoredChunk(chunk, score, lexical=score)
+            for chunk, score in zip(self.chunks, self.scores(question))
+            if score > 0
         ]
         scored.sort(key=lambda s: s.score, reverse=True)
         return Retrieval(scored[:k])
 
 
+_CLIENT = None
+
+
+def _client():
+    """Cliente único y perezoso: sin denso no se importa el SDK ni se abre conexión."""
+    global _CLIENT
+    if _CLIENT is None:
+        from openai import OpenAI
+
+        _CLIENT = OpenAI(
+            max_retries=int(os.getenv("OPENAI_MAX_RETRIES", "3")),
+            timeout=float(os.getenv("OPENAI_TIMEOUT", "30")),
+        )
+    return _CLIENT
+
+
+def _openai_embed(texts: list[str]) -> list[list[float]]:
+    response = _client().embeddings.create(model=EMBEDDING_MODEL, input=texts)
+    return [item.embedding for item in response.data]
+
+
+def _unit_rows(vectors: list[list[float]]) -> np.ndarray:
+    """Vectores normalizados por filas: con norma 1, el coseno es el producto escalar."""
+    matrix = np.asarray(vectors, dtype=float)
+    return matrix / np.maximum(np.linalg.norm(matrix, axis=1, keepdims=True), 1e-12)
+
+
+class EmbeddingIndex:
+    """Índice denso: coseno entre la pregunta y cada chunk, con los vectores normalizados."""
+
+    def __init__(self, chunks: list[Chunk], embed=_openai_embed) -> None:
+        self.chunks = chunks
+        self.available = True
+        self._embed = embed
+        self._vectors: np.ndarray | None = None
+        self._lock = threading.Lock()
+
+    def vectors(self) -> np.ndarray:
+        """Los vectores de los chunks, calculados una sola vez (una llamada)."""
+        with self._lock:  # sin él, N peticiones en frío embeben los chunks N veces
+            if self._vectors is None:
+                self._vectors = _unit_rows(self._embed([c.indexable for c in self.chunks]))
+        return self._vectors
+
+    def similarities(self, question: str) -> list[float] | None:
+        """Coseno con cada chunk, o None si el denso no está disponible."""
+        if not self.available:
+            return None
+        try:
+            return list(self.vectors() @ _unit_rows(self._embed([question]))[0])
+        except Exception:  # red, cuota, key inválida: el híbrido sigue con BM25
+            self.available = False
+            return None
+
+
+def _ranking(scores: list[float], floor: float) -> dict[int, int]:
+    """Índices por encima del suelo, ordenados por score -> puesto (1-based)."""
+    candidates = sorted(
+        (i for i, s in enumerate(scores) if s > floor), key=lambda i: -scores[i]
+    )
+    return {i: rank for rank, i in enumerate(candidates, start=1)}
+
+
+class HybridIndex:
+    """BM25 + embeddings fusionados por RRF; sin `embed` se queda en solo léxico.
+
+    Candidato es lo que pasa el filtro de *alguno* de los dos: score léxico > 0 o coseno
+    por encima de `MIN_COSINE`.
+    """
+
+    def __init__(self, chunks: list[Chunk], embed=None) -> None:
+        self.lexical = BM25Index(chunks)
+        self.dense = EmbeddingIndex(chunks, embed) if embed else None
+
+    @property
+    def hybrid(self) -> bool:
+        return self.dense is not None and self.dense.available
+
+    def search(self, question: str, k: int = DEFAULT_K) -> Retrieval:
+        similarities = self.dense.similarities(question) if self.dense else None
+        lexical = self.lexical.scores(question)
+
+        rankings = [_ranking(lexical, 0.0)]
+        if similarities is not None:
+            rankings.append(_ranking(similarities, MIN_COSINE))
+
+        scored = [
+            ScoredChunk(
+                self.lexical.chunks[i],
+                sum(1 / (RRF_K + r[i]) for r in rankings if i in r),
+                lexical=lexical[i],
+                dense=None if similarities is None else similarities[i],
+            )
+            for i in set().union(*rankings)
+        ]
+        # Empate en RRF (mismo puesto por cada vía): decide el coseno, que es el único de
+        # los dos scores comparable entre preguntas.
+        scored.sort(key=lambda s: (s.score, s.dense or 0.0), reverse=True)
+        return Retrieval(scored[:k])
+
+
 CHUNKS = load_chunks()
-INDEX = BM25Index(CHUNKS)
+# Sin API key no hay denso: los tests y `--lexical` corren sin tocar la red.
+INDEX = HybridIndex(CHUNKS, _openai_embed if os.getenv("OPENAI_API_KEY") else None)
+
+
+def retriever_name() -> str:
+    return f"híbrido (BM25 + {EMBEDDING_MODEL}, RRF)" if INDEX.hybrid else "léxico (BM25)"
 
 
 def retrieve(question: str, k: int = DEFAULT_K) -> Retrieval:
-    """
-    Búsqueda sobre el índice por defecto.
-
-    No hay umbral de score porque los valores de BM25 no son comparables entre preguntas;
-    ese gate llegará con la similitud coseno al añadir los embeddings.
-    """
+    """Búsqueda sobre el índice por defecto."""
     return INDEX.search(question, k)
 
 
@@ -168,7 +286,8 @@ if __name__ == "__main__":
 
     question = " ".join(sys.argv[1:]) or "¿Cuánto cuesta el plan Business?"
     r = retrieve(question)
-    print(f"Pregunta: {question}")
+    print(f"Pregunta: {question}   [{retriever_name()}]")
     print(f"Tokens:   {tokenize(question)}")
     for s in r.results:
-        print(f"  {s.score:6.3f}  {s.chunk.title}")
+        dense = "    n/a" if s.dense is None else f"{s.dense:6.3f}"
+        print(f"  rrf {s.score:.4f}  bm25 {s.lexical:6.3f}  cos {dense}  {s.chunk.title}")

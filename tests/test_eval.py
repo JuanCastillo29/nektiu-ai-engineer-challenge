@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "eval"))
 
+import rag
 import run
 
 
@@ -19,7 +20,8 @@ def case(id_: int, expected: str | None, category: str = "directa") -> run.Case:
 
 
 def retrieved(id_: int, expected: str | None, titles: list[str], **kwargs) -> run.RetrievalOutcome:
-    return run.RetrievalOutcome(case(id_, expected, **kwargs), titles)
+    results = [rag.ScoredChunk(rag.Chunk(t, ""), 1.0) for t in titles]
+    return run.RetrievalOutcome(case(id_, expected, **kwargs), results)
 
 
 def generated(

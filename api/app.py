@@ -14,16 +14,13 @@ import json
 import os
 from pathlib import Path
 
-from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from openai import OpenAI, OpenAIError
 
-import rag
-
-load_dotenv(Path(__file__).parent / ".env")
+import rag  # importarlo carga api/.env, del que sale la API key
 
 app = FastAPI(title="Nektiu AI Engineer Challenge API")
 
@@ -143,7 +140,12 @@ def generate(question: str, results: list[rag.ScoredChunk]) -> ChatResponse:
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "model": MODEL}
+    return {
+        "status": "ok",
+        "model": MODEL,
+        "hybrid_retrieval": rag.INDEX.hybrid,
+        "embedding_model": rag.EMBEDDING_MODEL,
+    }
 
 
 @app.post("/api/chat", response_model=ChatResponse)

@@ -1,7 +1,8 @@
 """
 Runner de evaluación sobre `eval/dataset.json`.
 
-    python eval/run.py --retrieval          # solo retrieval, sin llamadas al modelo
+    python eval/run.py --retrieval          # solo retrieval (usa embeddings si hay API key)
+    python eval/run.py --retrieval --lexical  # solo BM25: ni API key ni llamadas (CI)
     python eval/run.py                      # retrieval + generación (necesita OPENAI_API_KEY)
     python eval/run.py --k 3 --out r.json   # k del retriever y volcado por caso
 
@@ -82,7 +83,11 @@ class Case:
 @dataclass(frozen=True)
 class RetrievalOutcome:
     case: Case
-    titles: list[str]
+    results: list[rag.ScoredChunk]
+
+    @property
+    def titles(self) -> list[str]:
+        return [s.chunk.title for s in self.results]
 
     @property
     def rank(self) -> int:
@@ -134,11 +139,12 @@ def load_cases(path: Path = DATASET_PATH) -> list[Case]:
 # ---------------------------------------------------------------- retrieval
 
 
-def run_retrieval(cases: list[Case], k: int) -> list[RetrievalOutcome]:
-    return [
-        RetrievalOutcome(case, [s.chunk.title for s in rag.retrieve(case.question, k).results])
-        for case in cases
-    ]
+def run_retrieval(cases: list[Case], k: int, workers: int = 1) -> list[RetrievalOutcome]:
+    """En híbrido cada caso es una llamada de embedding, así que van en paralelo."""
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(
+            pool.map(lambda c: RetrievalOutcome(c, rag.retrieve(c.question, k).results), cases)
+        )
 
 
 def retrieval_metrics(outcomes: list[RetrievalOutcome]) -> dict:
@@ -195,9 +201,8 @@ def run_generation(
 
     def one(outcome: RetrievalOutcome) -> GenerationOutcome:
         case = outcome.case
-        retrieval = rag.retrieve(case.question, k)
-        if retrieval.grounded:
-            response = app.generate(case.question, retrieval.results)
+        if outcome.results:  # se reusa lo ya recuperado: no se paga dos veces el embedding
+            response = app.generate(case.question, outcome.results)
             answer, cited = response.answer, [s.title for s in response.sources]
         else:
             answer, cited = app.NO_SE, []  # misma puerta que en /api/chat
@@ -283,7 +288,8 @@ def report(
     models: dict[str, str] | None = None,
 ) -> None:
     m = retrieval_metrics(retrieval)
-    print(f"\nRETRIEVAL (k = {k})  ·  {m['n']} casos, {m['respondibles']} respondibles\n")
+    print(f"\nRETRIEVAL (k = {k})  ·  {m['n']} casos, {m['respondibles']} respondibles"
+          f"  ·  retriever {rag.retriever_name()}\n")
     print(f"  recall@{k}                     {_pct(m['recall_at_k'])}"
           f"   ({m['aciertos']}/{m['respondibles']})")
     print(f"  MRR@{k}                        {_pct(m['mrr_at_k'])}")
@@ -341,6 +347,7 @@ def dump(
     generated = {o.case.id: o for o in generation or []}
     payload = {
         "k": k,
+        "retriever": {"hibrido": rag.INDEX.hybrid, "embeddings": rag.EMBEDDING_MODEL},
         "modelos": models,  # cambiar de juez cambia los números: queda registrado
         "retrieval": retrieval_metrics(retrieval),
         "por_categoria": {
@@ -372,7 +379,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluación de NektiBot.")
     parser.add_argument("--k", type=int, default=rag.DEFAULT_K, help="fragmentos a recuperar")
     parser.add_argument("--retrieval", action="store_true",
-                        help="solo retrieval: no llama al modelo ni necesita API key")
+                        help="solo retrieval: no llama al modelo de respuesta ni al juez")
+    parser.add_argument("--lexical", action="store_true",
+                        help="apaga los embeddings: solo BM25, sin red (para CI)")
     parser.add_argument("--limit", type=int, help="evaluar solo los N primeros casos")
     parser.add_argument("--workers", type=int, default=4, help="llamadas en paralelo")
     parser.add_argument("--out", type=Path, help="volcar el resultado por caso en JSON")
@@ -381,8 +390,11 @@ def main() -> None:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
+    if args.lexical:
+        rag.INDEX = rag.HybridIndex(rag.CHUNKS)  # sin embedder: solo BM25
+
     cases = load_cases()[: args.limit]
-    retrieval = run_retrieval(cases, args.k)
+    retrieval = run_retrieval(cases, args.k, args.workers)
     generation, models = (
         (None, None) if args.retrieval else run_generation(retrieval, args.k, args.workers)
     )
