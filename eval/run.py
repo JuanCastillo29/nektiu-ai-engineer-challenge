@@ -27,6 +27,9 @@ from pathlib import Path
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT / "api"))
 
+# El runner ya imprime su propio informe; los spans de cada caso solo estorban.
+os.environ.setdefault("LOG_LEVEL", "WARNING")
+
 import rag  # noqa: E402
 
 DATASET_PATH = Path(__file__).parent / "dataset.json"

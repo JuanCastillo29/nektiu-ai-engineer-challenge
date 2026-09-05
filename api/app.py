@@ -11,15 +11,17 @@ Ejecutar en local:
 """
 
 import json
+import logging
 import os
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from openai import OpenAI, OpenAIError
 
+import observability as obs
 import rag  # importarlo carga api/.env, del que sale la API key
 
 app = FastAPI(title="Nektiu AI Engineer Challenge API")
@@ -31,6 +33,22 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.middleware("http")
+async def traced(request: Request, call_next):
+    """Una traza por petición, propagada al cliente en `X-Trace-Id`."""
+    trace_id = obs.trace_id_from(request.headers.get("traceparent"))
+    with obs.trace(
+        "http.request",
+        trace_id,
+        method=request.method,
+        path=request.url.path,
+    ) as fields:
+        response = await call_next(request)
+        fields["status_code"] = response.status_code
+        response.headers["X-Trace-Id"] = trace_id
+        return response
+
 
 client = OpenAI(
     api_key=os.getenv("OPENAI_API_KEY"),
@@ -110,6 +128,16 @@ def cite(used: list[int], results: list[rag.ScoredChunk]) -> list[Source]:
     return [Source(title=c.title, text=c.text) for c in chunks]
 
 
+def usage_fields(completion) -> dict:
+    """Tokens de la llamada, si el proveedor los informa: es lo que se factura."""
+    usage = getattr(completion, "usage", None)
+    return {
+        field: getattr(usage, field, None)
+        for field in ("prompt_tokens", "completion_tokens", "total_tokens")
+        if getattr(usage, field, None) is not None
+    }
+
+
 def generate(question: str, results: list[rag.ScoredChunk]) -> ChatResponse:
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -121,19 +149,35 @@ def generate(question: str, results: list[rag.ScoredChunk]) -> ChatResponse:
             ),
         },
     ]
-    for _ in range(PARSE_ATTEMPTS):
-        completion = client.chat.completions.create(
-            model=MODEL,
-            temperature=TEMPERATURE,
-            response_format={"type": "json_schema", "json_schema": ANSWER_SCHEMA},
-            messages=messages,
-        )
+    for attempt in range(1, PARSE_ATTEMPTS + 1):
+        with obs.span(
+            "llm.chat", model=MODEL, temperature=TEMPERATURE, attempt=attempt
+        ) as fields:
+            completion = client.chat.completions.create(
+                model=MODEL,
+                temperature=TEMPERATURE,
+                response_format={"type": "json_schema", "json_schema": ANSWER_SCHEMA},
+                messages=messages,
+            )
+            fields |= usage_fields(completion)
         try:
             payload = json.loads(completion.choices[0].message.content or "")
             answer, used = payload["answer"], payload["used"]
         except (json.JSONDecodeError, KeyError, TypeError):
+            # El JSON estricto no debería fallar: si se repite, mirar modelo o schema.
+            obs.log("model_response_unparsable", level=logging.WARNING, attempt=attempt)
             continue
-        return ChatResponse(answer=answer, sources=cite(used, results))
+
+        response = ChatResponse(answer=answer, sources=cite(used, results))
+        obs.log(
+            "answer_generated",
+            attempt=attempt,
+            used=used,
+            sources=len(response.sources),
+            abstained=answer == NO_SE,
+            answer_chars=len(answer),
+        )
+        return response
 
     raise HTTPException(status_code=502, detail="Respuesta del modelo ilegible.")
 
@@ -154,15 +198,23 @@ def chat(req: ChatRequest):
     if not question:
         raise HTTPException(status_code=422, detail="La pregunta está vacía.")
 
-    retrieval = rag.retrieve(question)
-    # Sin candidatos -> nos ahorramos la llamada al modelo.
-    if not retrieval.grounded:
-        return ChatResponse(answer=NO_SE, sources=[])
+    with obs.span("chat", **obs.question_fields(question)) as fields:
+        retrieval = rag.retrieve(question)
+        # Sin candidatos -> nos ahorramos la llamada al modelo.
+        if not retrieval.grounded:
+            fields["outcome"] = "not_grounded"
+            return ChatResponse(answer=NO_SE, sources=[])
 
-    try:
-        return generate(question, retrieval.results)
-    except OpenAIError as exc:
-        raise HTTPException(status_code=502, detail=f"Error del proveedor: {exc}") from exc
+        try:
+            response = generate(question, retrieval.results)
+        except OpenAIError as exc:
+            raise HTTPException(
+                status_code=502, detail=f"Error del proveedor: {exc}"
+            ) from exc
+
+        fields["outcome"] = "answered"
+        fields["sources"] = [s.title for s in response.sources]
+        return response
 
 FRONTEND_DIR = Path(__file__).parent.parent / "frontend"
 app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")

@@ -35,7 +35,7 @@ Sin API key el retrieval funciona igual, solo que sin la mitad densa.
 ### Tests
 
 ```bash
-python -m pytest tests -q      # 82 tests, sin red: ni modelo ni embeddings
+python -m pytest tests -q      # 113 tests, sin red: ni modelo ni embeddings
 ```
 
 ### Endpoints
@@ -77,6 +77,7 @@ pregunta ───────────────────────�
 - [`api/rag.py`](api/rag.py) — troceado y retrieval.
 - [`api/app.py`](api/app.py) — API, prompt, generación y citas.
 - [`frontend/index.html`](frontend/index.html) — la interfaz entera, en un fichero.
+- [`api/observability.py`](api/observability.py) — logs JSON y trazas (ver abajo).
 - [`eval/run.py`](eval/run.py) — el runner de la evaluación (ver abajo).
 
 ## Decisiones
@@ -172,6 +173,58 @@ sin variable de entorno con la URL del backend. La API key vive solo en el servi
 **Backend sin estado.** `POST /api/chat` solo acepta `question`; el hilo de conversación
 es únicamente visual. Con preguntas independientes sobre un manual no aporta, y evita
 tener que decidir qué parte del historial entra en el contexto.
+
+---
+
+## Observabilidad
+
+Cada petición escribe **una línea de JSON por etapa** en stdout, que es de donde leen
+Render y cualquier agregador. Las etapas son *spans*: `http.request` cuelga de la traza,
+`chat` cuelga de él, y de `chat` cuelgan `retrieval`, `embeddings.*` y `llm.chat`.
+
+```
+$ curl -s localhost:8000/api/chat -H 'content-type: application/json'        -d '{"question": "¿Cuánto cuesta el plan Business?"}'
+
+{"ts":"…","level":"INFO","msg":"retrieval","trace_id":"4bf92f…","span_id":"714cc4…",
+ "parent_span_id":"1a8009…","duration_ms":142.6,"k":2,"hybrid":true,"grounded":true,
+ "titles":["Planes y precios","Fuentes de datos soportadas"],
+ "scores":[{"rrf":0.0325,"bm25":1.94,"cos":0.61},{"rrf":0.0161,"bm25":1.75,"cos":0.28}]}
+{"ts":"…","msg":"llm.chat","duration_ms":1893.4,"model":"gpt-5.6-luna","attempt":1,
+ "prompt_tokens":812,"completion_tokens":41,"total_tokens":853,"status":"ok"}
+{"ts":"…","msg":"chat","duration_ms":2041.7,"question":"¿Cuánto cuesta el plan Business?",
+ "outcome":"answered","sources":["Planes y precios"]}
+{"ts":"…","msg":"http.request","duration_ms":2044.9,"method":"POST","path":"/api/chat",
+ "status_code":200}
+```
+
+**Por qué trazas y no solo líneas de log.** Un RAG falla por etapas y todas terminan en la
+misma respuesta mediocre: la lenta puede ser el retrieval denso o el modelo, y la mala
+respuesta puede venir de un fragmento que no llegó o de un prompt que no lo usó. Con
+`duration_ms` por span y los scores de lo recuperado en el mismo `trace_id`, esa pregunta
+se contesta mirando una traza en vez de reproduciendo el caso.
+
+Las preguntas que responde el log tal como está:
+
+- **Dónde se va el tiempo.** El arranque en frío tiene span propio (`embeddings.index`,
+  los vectores de los 7 chunks) para que no se confunda con la latencia normal.
+- **Si el retrieval ha degradado a solo BM25.** `hybrid` va en cada span de `retrieval`, y
+  la caída deja un `dense_retrieval_disabled` con la excepción. Es el fallo silencioso del
+  sistema —responde 200 y solo baja el recall—, así que es lo primero que hay que ver.
+- **Cuánto se abstiene y por qué.** `outcome: not_grounded` es abstención sin llamar al
+  modelo, con los `scores` al lado para juzgar si el suelo de coseno se pasó de estricto.
+- **Qué cuesta.** Tokens por llamada, y `attempt`/`model_response_unparsable` para saber si
+  se está pagando el mismo prompt dos veces.
+
+**Sin dependencias nuevas.** Los campos son los de OpenTelemetry (`trace_id`, `span_id`,
+`parent_span_id`), y el servicio continúa el `traceparent` que le llegue y devuelve
+`X-Trace-Id` en la respuesta —el usuario puede reportar un fallo con su identificador—,
+pero no exporta a un colector: el SDK son varios megas y un proceso más en un plan free
+donde el cuello de botella es el arranque en frío. Migrar cuando haga falta es cambiar
+`observability.py`, porque el resto del código solo ve `obs.span(...)`.
+
+Se ajusta con `LOG_LEVEL` (por defecto `INFO`), `SERVICE_NAME` y `LOG_QUESTION_CHARS`,
+que recorta el texto de las preguntas en el log; a `0` deja solo su longitud, para un
+despliegue donde las preguntas de los usuarios sean dato sensible.
 
 ---
 

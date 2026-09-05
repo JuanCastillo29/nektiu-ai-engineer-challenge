@@ -8,6 +8,7 @@ Sin API key el denso se apaga y queda solo BM25.
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import re
@@ -19,6 +20,8 @@ from pathlib import Path
 
 import numpy as np
 from dotenv import load_dotenv
+
+import observability as obs
 
 load_dotenv(Path(__file__).parent / ".env")  # la key decide si hay retrieval denso
 
@@ -207,7 +210,9 @@ class EmbeddingIndex:
         """Los vectores de los chunks, calculados una sola vez (una llamada)."""
         with self._lock:  # sin él, N peticiones en frío embeben los chunks N veces
             if self._vectors is None:
-                self._vectors = _unit_rows(self._embed([c.indexable for c in self.chunks]))
+                # Span propio: es el arranque en frío que paga la primera pregunta.
+                with obs.span("embeddings.index", chunks=len(self.chunks), model=EMBEDDING_MODEL):
+                    self._vectors = _unit_rows(self._embed([c.indexable for c in self.chunks]))
         return self._vectors
 
     def similarities(self, question: str) -> list[float] | None:
@@ -215,9 +220,16 @@ class EmbeddingIndex:
         if not self.available:
             return None
         try:
-            return list(self.vectors() @ _unit_rows(self._embed([question]))[0])
+            with obs.span("embeddings.query", model=EMBEDDING_MODEL):
+                return list(self.vectors() @ _unit_rows(self._embed([question]))[0])
         except Exception:  # red, cuota, key inválida: el híbrido sigue con BM25
             self.available = False
+            obs.log(
+                "dense_retrieval_disabled",
+                level=logging.WARNING,
+                model=EMBEDDING_MODEL,
+                exc_info=True,
+            )
             return None
 
 
@@ -245,6 +257,22 @@ class HybridIndex:
         return self.dense is not None and self.dense.available
 
     def search(self, question: str, k: int = DEFAULT_K) -> Retrieval:
+        with obs.span("retrieval", k=k, hybrid=self.hybrid) as fields:
+            retrieval = self._search(question, k)
+            fields |= {
+                "hybrid": self.hybrid,  # el denso puede haberse caído durante la búsqueda
+                "results": len(retrieval.results),
+                "grounded": retrieval.grounded,
+                "titles": [s.chunk.title for s in retrieval.results],
+                "scores": [
+                    {"rrf": round(s.score, 4), "bm25": round(s.lexical, 3),
+                     "cos": None if s.dense is None else round(s.dense, 3)}
+                    for s in retrieval.results
+                ],
+            }
+            return retrieval
+
+    def _search(self, question: str, k: int) -> Retrieval:
         similarities = self.dense.similarities(question) if self.dense else None
         lexical = self.lexical.scores(question)
 
@@ -271,6 +299,8 @@ CHUNKS = load_chunks()
 # Sin API key no hay denso: los tests y `--lexical` corren sin tocar la red.
 INDEX = HybridIndex(CHUNKS, _openai_embed if os.getenv("OPENAI_API_KEY") else None)
 
+obs.log("index_ready", chunks=len(CHUNKS), hybrid=INDEX.hybrid, embedding_model=EMBEDDING_MODEL)
+
 
 def retriever_name() -> str:
     return f"híbrido (BM25 + {EMBEDDING_MODEL}, RRF)" if INDEX.hybrid else "léxico (BM25)"
@@ -283,6 +313,9 @@ def retrieve(question: str, k: int = DEFAULT_K) -> Retrieval:
 
 if __name__ == "__main__":
     import sys
+
+    if "LOG_LEVEL" not in os.environ:
+        logging.getLogger().setLevel(logging.WARNING)
 
     question = " ".join(sys.argv[1:]) or "¿Cuánto cuesta el plan Business?"
     r = retrieve(question)
