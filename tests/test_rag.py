@@ -124,7 +124,7 @@ class TestRetrieval(unittest.TestCase):
         retrieval = rag.Retrieval([
             rag.ScoredChunk(a, 3.0), rag.ScoredChunk(b, 2.0), rag.ScoredChunk(a, 1.0),
         ])
-        self.assertEqual(retrieval.sources, ["A", "B"])
+        self.assertEqual(retrieval.sources, [a, b])
         self.assertTrue(retrieval.grounded)
 
     def test_sin_resultados_no_hay_fuentes(self):
@@ -138,7 +138,8 @@ class TestRetrieveIntegracion(unittest.TestCase):
         self.assertGreater(len(rag.CHUNKS), 0)
 
     def test_precio_cita_la_seccion_de_planes(self):
-        self.assertIn("Planes y precios", rag.retrieve("¿Cuánto cuesta el plan Business?").sources)
+        sources = rag.retrieve("¿Cuánto cuesta el plan Business?").sources
+        self.assertIn("Planes y precios", [c.title for c in sources])
 
     def test_k_por_defecto(self):
         self.assertEqual(rag.DEFAULT_K, 2)

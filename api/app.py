@@ -17,6 +17,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from openai import OpenAI, OpenAIError
 
@@ -88,9 +89,16 @@ class ChatRequest(BaseModel):
     question: str
 
 
+class Source(BaseModel):
+    """Fragmento citado: título de la sección y su texto, para poder mostrarlo entero."""
+
+    title: str
+    text: str
+
+
 class ChatResponse(BaseModel):
     answer: str
-    sources: list[str] = []
+    sources: list[Source] = []
 
 
 def build_context(results: list[rag.ScoredChunk]) -> str:
@@ -99,9 +107,10 @@ def build_context(results: list[rag.ScoredChunk]) -> str:
     )
 
 
-def cite(used: list[int], results: list[rag.ScoredChunk]) -> list[str]:
-    """Índices que devuelve el modelo -> títulos citables."""
-    return rag.Retrieval([results[i - 1] for i in used if 1 <= i <= len(results)]).sources
+def cite(used: list[int], results: list[rag.ScoredChunk]) -> list[Source]:
+    """Índices que devuelve el modelo -> fuentes citables."""
+    chunks = rag.Retrieval([results[i - 1] for i in used if 1 <= i <= len(results)]).sources
+    return [Source(title=c.title, text=c.text) for c in chunks]
 
 
 def generate(question: str, results: list[rag.ScoredChunk]) -> ChatResponse:
@@ -152,3 +161,6 @@ def chat(req: ChatRequest):
         return generate(question, retrieval.results)
     except OpenAIError as exc:
         raise HTTPException(status_code=502, detail=f"Error del proveedor: {exc}") from exc
+
+FRONTEND_DIR = Path(__file__).parent.parent / "frontend"
+app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")

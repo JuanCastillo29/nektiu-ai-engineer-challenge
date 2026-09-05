@@ -64,14 +64,20 @@ class TestBuildContext(unittest.TestCase):
 
 
 class TestCite(unittest.TestCase):
-    def test_traduce_indices_a_titulos(self):
-        self.assertEqual(app.cite([2, 1], [PLANES, SOPORTE]), ["Soporte", "Planes y precios"])
+    @staticmethod
+    def titles(sources):
+        return [s.title for s in sources]
+
+    def test_traduce_indices_a_fuentes(self):
+        sources = app.cite([2, 1], [PLANES, SOPORTE])
+        self.assertEqual(self.titles(sources), ["Soporte", "Planes y precios"])
+        self.assertEqual(sources[0].text, SOPORTE.chunk.text)
 
     def test_descarta_indices_fuera_de_rango(self):
-        self.assertEqual(app.cite([0, 3, -1, 1], [PLANES, SOPORTE]), ["Planes y precios"])
+        self.assertEqual(self.titles(app.cite([0, 3, -1, 1], [PLANES, SOPORTE])), ["Planes y precios"])
 
-    def test_elimina_titulos_duplicados(self):
-        self.assertEqual(app.cite([1, 1], [PLANES, SOPORTE]), ["Planes y precios"])
+    def test_elimina_fuentes_duplicadas(self):
+        self.assertEqual(self.titles(app.cite([1, 1], [PLANES, SOPORTE])), ["Planes y precios"])
 
     def test_sin_citas_lista_vacia(self):
         self.assertEqual(app.cite([], [PLANES]), [])
@@ -86,13 +92,13 @@ class TestGenerate(unittest.TestCase):
     def test_respuesta_valida_con_sus_fuentes(self):
         response, completions = self._generate(answer("149 euros.", [1]))
         self.assertEqual(response.answer, "149 euros.")
-        self.assertEqual(response.sources, ["Planes y precios"])
+        self.assertEqual(response.sources, [app.Source(title="Planes y precios", text=PLANES.chunk.text)])
         self.assertEqual(len(completions.calls), 1)
 
     def test_reintenta_una_vez_si_el_json_es_ilegible(self):
         response, completions = self._generate(completion("no soy json"), answer("ok", [2]))
         self.assertEqual(response.answer, "ok")
-        self.assertEqual(response.sources, ["Soporte"])
+        self.assertEqual([s.title for s in response.sources], ["Soporte"])
         self.assertEqual(len(completions.calls), 2)
 
     def test_agota_los_intentos_y_devuelve_502(self):
@@ -177,7 +183,13 @@ class TestChat(unittest.TestCase):
         with patch.object(app, "client", client), patch.object(rag, "retrieve", return_value=retrieval):
             response = self._post({"question": "¿Cuánto cuesta el plan Business?"})
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"answer": "149 euros.", "sources": ["Planes y precios"]})
+        self.assertEqual(
+            response.json(),
+            {
+                "answer": "149 euros.",
+                "sources": [{"title": "Planes y precios", "text": PLANES.chunk.text}],
+            },
+        )
         self.assertEqual(len(completions.calls), 1)
 
     def test_sin_candidatos_responde_no_lo_se_sin_llamar_al_modelo(self):
@@ -227,14 +239,17 @@ class TestChatIntegracion(unittest.TestCase):
 
     def test_pregunta_del_documento_cita_su_seccion(self):
         question = "¿Cuánto cuesta el plan Business?"
-        expected = rag.retrieve(question).sources
+        expected = rag.retrieve(question).sources  # chunks, en orden de relevancia
         # El modelo cita todos los fragmentos recuperados; el orden lo fija el retrieval.
         client, completions = fake_client(answer("149 euros al mes.", list(range(1, len(expected) + 1))))
         with patch.object(app, "client", client):
             response = TestClient(app.app).post("/api/chat", json={"question": question})
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["sources"], expected)
-        self.assertIn("Planes y precios", expected)
+        self.assertEqual(
+            response.json()["sources"],
+            [{"title": c.title, "text": c.text} for c in expected],
+        )
+        self.assertIn("Planes y precios", [c.title for c in expected])
         self.assertIn("Planes y precios", completions.calls[0]["messages"][1]["content"])
 
     def test_pregunta_ajena_al_documento_no_llama_al_modelo(self):

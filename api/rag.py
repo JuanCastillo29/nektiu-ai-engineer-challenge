@@ -86,9 +86,9 @@ class Retrieval:
         return bool(self.results)
 
     @property
-    def sources(self) -> list[str]:
-        """Títulos citables, sin duplicados y en orden de relevancia."""
-        return list(dict.fromkeys(s.chunk.title for s in self.results))
+    def sources(self) -> list[Chunk]:
+        """Fragmentos citables, sin duplicados y en orden de relevancia."""
+        return list(dict.fromkeys(s.chunk for s in self.results))
 
 
 def load_chunks(path: Path = DATA_PATH) -> list[Chunk]:

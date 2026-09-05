@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NektiBot — asistente del manual</title>
+<style>
+  :root {
+    --fondo: #f4f5f7;
+    --panel: #ffffff;
+    --borde: #e2e5ea;
+    --texto: #1b1f24;
+    --tenue: #6b7280;
+    --marca: #2563eb;
+    --error: #b91c1c;
+    --error-fondo: #fef2f2;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    height: 100dvh;
+    display: flex;
+    flex-direction: column;
+    background: var(--fondo);
+    color: var(--texto);
+    font: 16px/1.5 system-ui, sans-serif;
+  }
+
+  /* Cabecera y formulario no se encogen; la lista de mensajes se queda el resto. */
+  header, footer {
+    flex-shrink: 0;
+    background: var(--panel);
+    padding: 12px 16px;
+  }
+  header { border-bottom: 1px solid var(--borde); }
+  footer { border-top: 1px solid var(--borde); }
+
+  /* Misma anchura para cabecera, mensajes y formulario. */
+  .centrado {
+    max-width: 720px;
+    margin: 0 auto;
+    width: 100%;
+  }
+
+  h1 { font-size: 1.05rem; margin: 0; }
+  .subtitulo { color: var(--tenue); font-size: 0.85rem; margin: 2px 0 0; }
+
+  #mensajes {
+    flex: 1;
+    overflow-y: auto;
+    padding: 20px 16px;
+  }
+
+  .burbuja {
+    max-width: 80%;
+    margin-bottom: 14px;
+    padding: 10px 14px;
+    border-radius: 14px;
+    white-space: pre-wrap;   /* respeta los saltos de línea del modelo */
+    overflow-wrap: anywhere; /* una palabra larga no desborda a lo ancho */
+  }
+  .usuario {
+    margin-left: auto;
+    background: var(--marca);
+    color: #fff;
+    border-bottom-right-radius: 4px;
+  }
+  .asistente {
+    background: var(--panel);
+    border: 1px solid var(--borde);
+    border-bottom-left-radius: 4px;
+  }
+  .error {
+    background: var(--error-fondo);
+    border: 1px solid var(--error);
+    color: var(--error);
+  }
+  .cargando { color: var(--tenue); }
+
+  .fuentes {
+    margin-top: 10px;
+    padding-top: 8px;
+    border-top: 1px solid var(--borde);
+    font-size: 0.82rem;
+  }
+  .fuentes > span { color: var(--tenue); }
+
+  details {
+    margin-top: 5px;
+    border: 1px solid var(--borde);
+    border-radius: 8px;
+    background: var(--fondo);
+  }
+  summary {
+    padding: 6px 10px;
+    color: var(--marca);
+    cursor: pointer;
+  }
+  details[open] summary { border-bottom: 1px solid var(--borde); }
+  .fragmento {
+    padding: 8px 10px;
+    color: var(--tenue);
+  }
+
+  #ejemplos {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 14px;
+  }
+  #ejemplos button {
+    padding: 7px 12px;
+    border: 1px solid var(--borde);
+    border-radius: 999px;
+    background: var(--panel);
+    color: var(--texto);
+    font: inherit;
+    font-size: 0.85rem;
+    cursor: pointer;
+  }
+  #ejemplos button:hover { border-color: var(--marca); color: var(--marca); }
+
+  form { display: flex; gap: 8px; }
+  input, form button {
+    font: inherit;
+    border-radius: 10px;
+    border: 1px solid var(--borde);
+    padding: 11px 14px;
+  }
+  input { flex: 1; min-width: 0; }
+  input:focus { outline: 2px solid var(--marca); outline-offset: -1px; }
+  form button {
+    border-color: var(--marca);
+    background: var(--marca);
+    color: #fff;
+    cursor: pointer;
+  }
+  form button:disabled, input:disabled { opacity: 0.5; cursor: default; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="centrado">
+    <h1>NektiBot</h1>
+    <p class="subtitulo">Preguntas sobre el manual de producto. Responde solo con lo que dice el documento.</p>
+  </div>
+</header>
+
+<main id="mensajes">
+  <div class="centrado">
+    <div id="ejemplos"></div>
+    <div id="hilo"></div>
+  </div>
+</main>
+
+<footer>
+  <form id="formulario" class="centrado">
+    <input id="pregunta" autocomplete="off" placeholder="Escribe tu pregunta…" autofocus>
+    <button type="submit">Enviar</button>
+  </form>
+</footer>
+
+<script>
+  // La última no está en el documento: sirve para enseñar el "No lo sé".
+  const EJEMPLOS = [
+    "¿Qué es NektiBot?",
+    "¿Cuánto cuesta el plan Business?",
+    "¿Puede NektiBot enviar correos?",
+    "¿NektiBot tiene app para iPhone?",
+  ];
+
+  const hilo = document.getElementById("hilo");
+  const ejemplos = document.getElementById("ejemplos");
+  const mensajes = document.getElementById("mensajes");
+  const formulario = document.getElementById("formulario");
+  const entrada = document.getElementById("pregunta");
+  const boton = formulario.querySelector("button");
+
+  for (const texto of EJEMPLOS) {
+    const chip = document.createElement("button");
+    chip.textContent = texto;
+    chip.addEventListener("click", () => preguntar(texto));
+    ejemplos.appendChild(chip);
+  }
+
+  /** Añade una burbuja al hilo y baja el scroll. Devuelve el nodo para poder retirarlo. */
+  function añadir(clase, texto, fuentes = []) {
+    const burbuja = document.createElement("div");
+    burbuja.className = `burbuja ${clase}`;
+    burbuja.textContent = texto;  // textContent, no innerHTML: el texto del modelo no es HTML
+
+    if (fuentes.length) {
+      const pie = document.createElement("div");
+      pie.className = "fuentes";
+
+      const rotulo = document.createElement("span");
+      rotulo.textContent = fuentes.length === 1 ? "Fuente citada:" : "Fuentes citadas:";
+      pie.appendChild(rotulo);
+
+      // Un desplegable por fuente: el título siempre visible, el fragmento al abrirlo.
+      for (const fuente of fuentes) {
+        const desplegable = document.createElement("details");
+        const titulo = document.createElement("summary");
+        titulo.textContent = fuente.title;
+        const fragmento = document.createElement("div");
+        fragmento.className = "fragmento";
+        fragmento.textContent = fuente.text;
+        desplegable.append(titulo, fragmento);
+        pie.appendChild(desplegable);
+      }
+
+      burbuja.appendChild(pie);
+    }
+
+    hilo.appendChild(burbuja);
+    mensajes.scrollTop = mensajes.scrollHeight;
+    return burbuja;
+  }
+
+  async function preguntar(pregunta) {
+    ejemplos.hidden = true;
+    entrada.value = "";
+    entrada.disabled = boton.disabled = true;
+
+    añadir("usuario", pregunta);
+    const cargando = añadir("asistente cargando", "Buscando en el documento…");
+
+    try {
+      // URL relativa: el mismo servicio sirve esta página y la API.
+      const respuesta = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question: pregunta }),
+      });
+      const datos = await respuesta.json().catch(() => ({}));
+
+      if (!respuesta.ok) {
+        throw new Error(datos.detail || `El servidor respondió ${respuesta.status}.`);
+      }
+      añadir("asistente", datos.answer, datos.sources || []);
+    } catch (error) {
+      añadir("error", `No se pudo responder: ${error.message}`);
+    } finally {
+      cargando.remove();
+      entrada.disabled = boton.disabled = false;
+      entrada.focus();
+      mensajes.scrollTop = mensajes.scrollHeight;
+    }
+  }
+
+  // "submit" y no "click": así Enter también envía.
+  formulario.addEventListener("submit", (evento) => {
+    evento.preventDefault();
+    const pregunta = entrada.value.trim();
+    if (pregunta) preguntar(pregunta);
+  });
+</script>
+
+</body>
+</html>
